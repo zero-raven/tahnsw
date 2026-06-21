@@ -1,28 +1,122 @@
 # TAHNSW — Topology-Aware HNSW
 
-Full Python implementation of TAHNSW built on top of `hnswlib`.
+> A custom semantic search algorithm that improves upon HNSW by using **clustering coefficients** and **betweenness centrality** for smarter graph construction — with a full-stack showcase app to compare TAHNSW vs standard HNSW live.
 
-## Three Contributions
+---
+
+## Project Structure
+
+```
+el/
+├── tahnsw.py              # Core TAHNSW algorithm implementation
+├── benchmark.py           # CLI benchmark runner (TAHNSW vs HNSW)
+├── requirements.txt       # Python deps for standalone algorithm use
+│
+├── api/                   # FastAPI backend (semantic search server)
+│   ├── main.py            # API entrypoint (FastAPI app + endpoints)
+│   ├── corpus.py          # Loads movies, embeds them, builds both indexes
+│   ├── requirements.txt   # Backend Python dependencies
+│   └── data/
+│       └── movies.json    # Movie corpus used for semantic search
+│
+└── ui/                    # Next.js frontend (interactive showcase)
+    ├── app/               # Next.js app directory
+    ├── .env.local         # Frontend environment variables
+    └── package.json       # Node dependencies
+```
+
+---
+
+## Three Core Contributions of TAHNSW
 
 | # | What changes | How |
 |---|---|---|
-| 1 | Layer assignment | Replace random draw with clustering coefficient C(v) |
-| 2 | Adaptive degree M | Replace fixed M=16 with M(v) from betweenness centrality |
-| 3 | RNG edge pruning | Remove dominated edges at Layer 0 after neighbor selection |
+| 1 | **Layer assignment** | Replace random draw with clustering coefficient C(v) |
+| 2 | **Adaptive degree M** | Replace fixed M=16 with M(v) from betweenness centrality |
+| 3 | **RNG edge pruning** | Remove dominated edges at Layer 0 after neighbor selection |
 
-## Install
+---
+
+## Prerequisites
+
+- **Python 3.10+** with `pip`
+- **Node.js 18+** with `npm`
+- A virtual environment is recommended (the repo ships a `.venv/` folder)
+
+---
+
+## Running the Full Stack App
+
+The project has two parts that run simultaneously:
+
+### 1. Backend — FastAPI Server
 
 ```bash
-pip install hnswlib numpy matplotlib h5py
+# From the project root: /home/Kaiser/clg/el
+
+# Activate the virtual environment (if using .venv)
+source .venv/bin/activate
+
+# Install backend dependencies (first time only)
+pip install -r api/requirements.txt
+
+# Start the API server
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-## Quick Start
+The API will be available at **http://localhost:8000**
+
+> **Note:** On first startup, the server automatically:
+> 1. Downloads the `all-MiniLM-L6-v2` sentence-transformer model (~90 MB)
+> 2. Embeds all movies in the corpus
+> 3. Builds both the HNSW and TAHNSW indexes
+>
+> This takes a minute. The `/api/status/stream` SSE endpoint streams real-time progress to the frontend.
+
+#### Available API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/status` | Current build status |
+| `GET` | `/api/status/stream` | SSE stream of build progress |
+| `POST` | `/api/search` | Run a semantic search query |
+| `GET` | `/api/benchmark` | Recall–QPS curve data |
+| `GET` | `/api/info` | Corpus size, build times, TAHNSW stats |
+
+---
+
+### 2. Frontend — Next.js App
+
+Open a **new terminal**:
+
+```bash
+# Navigate to the UI directory
+cd ui/
+
+# Install Node dependencies (first time only)
+npm install
+
+# Start the dev server
+npm run dev
+```
+
+The frontend will be available at **http://localhost:3000**
+
+The `.env.local` file already points the frontend at the backend:
+```
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+---
+
+## Standalone Algorithm Usage
+
+Use TAHNSW directly in Python without the web app:
 
 ```python
 import numpy as np
 from tahnsw import TAHNSWIndex, TAHNSWConfig
 
-# Configure
 cfg = TAHNSWConfig(
     cluster_high_thresh = 0.70,   # C(v) > 0.70  →  leaf node  →  Layer 0
     cluster_low_thresh  = 0.20,   # C(v) < 0.20  →  hub  node  →  high layer
@@ -30,29 +124,36 @@ cfg = TAHNSWConfig(
     M_beta              = 0.5,    # leaf gets M × 0.5 connections
 )
 
-# Build index
 data = np.random.randn(50_000, 128).astype(np.float32)
 idx = TAHNSWIndex(dim=128, max_elements=50_000, config=cfg)
 idx.init_index(M=16, ef_construction=200)
 idx.add_items(data)
 
-# Search — identical to hnswlib
 queries = np.random.randn(100, 128).astype(np.float32)
 labels, dists = idx.knn_query(queries, k=10)
 ```
 
-## Benchmark
+Install standalone deps:
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Running the Benchmark
 
 ```bash
-# Quick test on synthetic clustered data (no downloads needed)
+# Quick synthetic benchmark (no downloads needed)
 python benchmark.py --mode synthetic --N 30000 --dim 128 --k 10
 
-# Full benchmark on SIFT-128 (download first)
+# Full benchmark on SIFT-128 dataset (download first)
 wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
 python benchmark.py --mode hdf5 --dataset sift-128-euclidean.hdf5 --k 10
 ```
 
-## Hyperparameter Tuning Guide
+---
+
+## Hyperparameter Reference
 
 | Parameter | Default | What it does | Range to try |
 |---|---|---|---|
@@ -63,15 +164,7 @@ python benchmark.py --mode hdf5 --dataset sift-128-euclidean.hdf5 --k 10
 | `sketch_S` | 30 | BFS samples for centrality | 20–100 |
 | `k_candidates` | 20 | Neighborhood for C(v) | 10–30 |
 
-## File Structure
-
-```
-tahnsw/
-├── tahnsw.py         # Main implementation — TAHNSWIndex + all modules
-├── benchmark.py      # TAHNSW vs HNSW benchmark runner
-├── requirements.txt  # Dependencies
-└── README.md         # This file
-```
+---
 
 ## Algorithm Complexity
 
@@ -84,3 +177,13 @@ tahnsw/
 
 Where `M_eff ≈ 0.75 × M` on clustered data → ~25% construction speedup.
 The `k²` term is a constant (k=20 is fixed) and does not grow with N.
+
+---
+
+## Quick Checklist
+
+| Step | Command | Port |
+|---|---|---|
+| Start backend | `uvicorn api.main:app --reload --port 8000` | 8000 |
+| Start frontend | `cd ui && npm run dev` | 3000 |
+| Open app | Browser → `http://localhost:3000` | — |
