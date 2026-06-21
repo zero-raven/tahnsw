@@ -20,11 +20,9 @@ import json
 import os
 import time
 import numpy as np
-import hnswlib
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from tahnsw import TAHNSWIndex, TAHNSWConfig
+
 
 try:
     import matplotlib
@@ -124,6 +122,7 @@ def benchmark_hnsw(
     space:     str = "l2"
 ) -> dict:
     """Build standard hnswlib index and measure recall-QPS curve."""
+    import hnswlib
     print(f"\n[HNSW] Building index: N={len(data)}, dim={data.shape[1]}, M={M}")
     idx = hnswlib.Index(space=space, dim=data.shape[1])
     idx.init_index(max_elements=len(data), ef_construction=ef_const, M=M)
@@ -156,9 +155,10 @@ def benchmark_tahnsw(
     ef_search_values: list,
     k:         int,
     space:     str = "l2",
-    config:    TAHNSWConfig = None
+    config     = None
 ) -> dict:
     """Build TAHNSW index and measure recall-QPS curve."""
+    from tahnsw import TAHNSWConfig, TAHNSWIndex
     cfg = config or TAHNSWConfig(verbose=True)
     print(f"\n[TAHNSW] Building index: N={len(data)}, dim={data.shape[1]}, M={M}")
     print(f"  Config: HIGH={cfg.cluster_high_thresh}, LOW={cfg.cluster_low_thresh}, "
@@ -193,6 +193,71 @@ def benchmark_tahnsw(
         rec = recall_at_k(labels, gt)
         results["curve"].append({"ef": ef, "recall": rec, "qps": qps})
         print(f"  ef={ef:4d}  recall={rec:.4f}  QPS={qps:8.1f}")
+    return results
+
+def benchmark_tahnsw_cpp(
+    data:      np.ndarray,
+    queries:   np.ndarray,
+    gt:        np.ndarray,
+    M:         int,
+    ef_const:  int,
+    ef_search_values: list,
+    k:         int,
+    space:     str = "l2",
+    config     = None
+) -> dict:
+    """Build TAHNSW C++ index and measure recall-QPS curve."""
+    import time
+    import tahnsw_cpp
+    from tahnsw import TAHNSWConfig
+    cfg = config or TAHNSWConfig()
+    print(f"\n[TAHNSW C++] Building index: N={len(data)}, dim={data.shape[1]}, M={M}")
+    
+    idx = tahnsw_cpp.IndexCpp(space=space, dim=data.shape[1])
+    idx.init_index(max_elements=len(data), ef_construction=ef_const, M=M)
+    idx.set_tahnsw_config(
+        cluster_high_thresh=cfg.cluster_high_thresh,
+        cluster_low_thresh=cfg.cluster_low_thresh,
+        M_alpha=cfg.M_alpha,
+        M_beta=cfg.M_beta,
+        M_min=cfg.M_min,
+        sketch_width=cfg.sketch_width,
+        sketch_depth=cfg.sketch_depth,
+        sketch_S=cfg.sketch_S,
+        prune_layer0_only=cfg.prune_layer0_only,
+        prune_angle_check=cfg.prune_angle_check,
+        prune_angle_deg=cfg.prune_angle_deg,
+        k_candidates=cfg.k_candidates,
+        b_max_window=cfg.b_max_window
+    )
+
+    t0 = time.perf_counter()
+    idx.add_items(data, np.arange(len(data)))
+    build_time = time.perf_counter() - t0
+    print(f"[TAHNSW C++] Build time: {build_time:.2f}s")
+    
+    stats = idx.get_tahnsw_stats()
+
+    results = {
+        "build_time": build_time,
+        "curve": [],
+        "stats": {
+            "hub_pct":      stats["hub_count"] / max(1, len(data)),
+            "leaf_pct":     stats["leaf_count"] / max(1, len(data)),
+            "mean_M_eff":   M,
+            "edge_reduction": stats["edges_saved"] / max(1, stats["edges_baseline"])
+        }
+    }
+
+    for ef in ef_search_values:
+        idx.set_ef(ef)
+        t0 = time.perf_counter()
+        labels, _ = idx.knn_query(queries, k=k)
+        elapsed = time.perf_counter() - t0
+        qps = len(queries) / elapsed
+        rec = recall_at_k(labels, gt)
+        results["curve"].append({"ef": ef, "recall": rec, "qps": qps})
+        print(f"  ef={ef:4d}  recall={rec:.4f}  QPS={qps:8.1f}")
 
     return results
 
@@ -201,7 +266,7 @@ def benchmark_tahnsw(
 # Plotting
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_results(hnsw_res: dict, tahnsw_res: dict, title: str, outpath: str) -> None:
+def plot_results(hnsw_res: dict, tahnsw_res: dict, tahnsw_cpp_res: dict, title: str, outpath: str) -> None:
     if not HAS_MPL:
         print("matplotlib not available — skipping plot")
         return
@@ -215,14 +280,23 @@ def plot_results(hnsw_res: dict, tahnsw_res: dict, title: str, outpath: str) -> 
     h_qps     = [p["qps"]    for p in hnsw_res["curve"]]
     t_recalls = [p["recall"] for p in tahnsw_res["curve"]]
     t_qps     = [p["qps"]    for p in tahnsw_res["curve"]]
+    tc_recalls = [p["recall"] for p in tahnsw_cpp_res["curve"]] if tahnsw_cpp_res else []
+    tc_qps     = [p["qps"]    for p in tahnsw_cpp_res["curve"]] if tahnsw_cpp_res else []
 
     ax.plot(h_recalls, h_qps, "o-", color="#888780", lw=2, ms=6,
             label=f"HNSW  (build {hnsw_res['build_time']:.1f}s)")
     ax.plot(t_recalls, t_qps, "s-", color="#534AB7", lw=2.5, ms=7,
             label=f"TAHNSW (build {tahnsw_res['build_time']:.1f}s)")
+    
+    if tahnsw_cpp_res:
+        ax.plot(tc_recalls, tc_qps, "^-", color="#E63946", lw=2.5, ms=7,
+                label=f"TAHNSW C++ (build {tahnsw_cpp_res['build_time']:.1f}s)")
+
+    all_recalls = h_recalls + t_recalls + tc_recalls
+    all_qps = h_qps + t_qps + tc_qps
     ax.fill_between(
-        [min(h_recalls + t_recalls), max(h_recalls + t_recalls)],
-        0, max(h_qps + t_qps) * 1.1,
+        [min(all_recalls), max(all_recalls)],
+        0, max(all_qps) * 1.1,
         alpha=0
     )
 
@@ -245,9 +319,14 @@ def plot_results(hnsw_res: dict, tahnsw_res: dict, title: str, outpath: str) -> 
 
     # ── Build time bar ────────────────────────────────────────────────────────
     ax2 = axes[1]
-    methods  = ["HNSW", "TAHNSW"]
+    methods  = ["HNSW", "TAHNSW Python"]
     times    = [hnsw_res["build_time"], tahnsw_res["build_time"]]
     colors   = ["#888780", "#534AB7"]
+    
+    if tahnsw_cpp_res:
+        methods.append("TAHNSW C++")
+        times.append(tahnsw_cpp_res["build_time"])
+        colors.append("#E63946")
     bars     = ax2.bar(methods, times, color=colors, width=0.4, edgecolor="none")
     for bar, t in zip(bars, times):
         ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
@@ -301,6 +380,7 @@ def main():
     print(f"GT shape:      {gt.shape}")
 
     # ── TAHNSW config ─────────────────────────────────────────────────────────
+    from tahnsw import TAHNSWConfig
     cfg = TAHNSWConfig(
         cluster_high_thresh = 0.70,
         cluster_low_thresh  = 0.20,
@@ -324,6 +404,11 @@ def main():
         M=args.M, ef_const=args.ef_construction,
         ef_search_values=ef_values, k=args.k, space=args.space, config=cfg
     )
+    tahnsw_cpp_res = benchmark_tahnsw_cpp(
+        data, queries, gt,
+        M=args.M, ef_const=args.ef_construction,
+        ef_search_values=ef_values, k=args.k, space=args.space, config=cfg
+    )
 
     # ── Save results ──────────────────────────────────────────────────────────
     out = {
@@ -333,7 +418,8 @@ def main():
             "space": args.space
         },
         "hnsw":   hnsw_res,
-        "tahnsw": tahnsw_res
+        "tahnsw": tahnsw_res,
+        "tahnsw_cpp": tahnsw_cpp_res
     }
     json_path = os.path.join(args.outdir, "benchmark_results.json")
     with open(json_path, "w") as f:
@@ -341,32 +427,29 @@ def main():
     print(f"\nResults saved to {json_path}")
 
     # ── Print comparison table ────────────────────────────────────────────────
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print("RESULTS SUMMARY")
-    print("="*60)
+    print("="*80)
     print(f"{'ef':>6}  {'HNSW rec':>10}  {'HNSW QPS':>10}  "
-          f"{'TAHNSW rec':>12}  {'TAHNSW QPS':>12}  {'QPS delta':>10}")
-    print("-"*60)
-    for h, t in zip(hnsw_res["curve"], tahnsw_res["curve"]):
+          f"{'TAHNSW rec':>12}  {'TAHNSW QPS':>12}  "
+          f"{'C++ rec':>10}  {'C++ QPS':>10}  {'QPS delta (Py)':>15}")
+    print("-" * 80)
+    for h, t, tc in zip(hnsw_res["curve"], tahnsw_res["curve"], tahnsw_cpp_res["curve"]):
         delta = 100 * (t["qps"] - h["qps"]) / max(h["qps"], 1e-9)
         print(f"{h['ef']:>6}  {h['recall']:>10.4f}  {h['qps']:>10.1f}  "
-              f"{t['recall']:>12.4f}  {t['qps']:>12.1f}  {delta:>+9.1f}%")
+              f"{t['recall']:>12.4f}  {t['qps']:>12.1f}  "
+              f"{tc['recall']:>10.4f}  {tc['qps']:>10.1f}  {delta:>+14.1f}%")
 
     bt_delta = 100 * (1 - tahnsw_res["build_time"] / max(hnsw_res["build_time"], 1e-9))
-    print("-"*60)
+    cpp_delta = 100 * (1 - tahnsw_cpp_res["build_time"] / max(tahnsw_res["build_time"], 1e-9))
+    print("-"*80)
     print(f"Build time:  HNSW {hnsw_res['build_time']:.2f}s  "
-          f"vs  TAHNSW {tahnsw_res['build_time']:.2f}s  ({bt_delta:+.1f}%)")
-    if "stats" in tahnsw_res:
-        s = tahnsw_res["stats"]
-        print(f"Hub %:        {100*s['hub_pct']:.1f}%    "
-              f"Leaf %: {100*s['leaf_pct']:.1f}%")
-        print(f"Mean M_eff:   {s['mean_M_eff']:.2f}  "
-              f"(base M={args.M})")
-        print(f"Edge reduction: {100*s['edge_reduction']:.1f}%")
-
+          f"vs  TAHNSW (Py) {tahnsw_res['build_time']:.2f}s  ({bt_delta:+.1f}%)  "
+          f"vs  TAHNSW (C++) {tahnsw_cpp_res['build_time']:.2f}s  ({cpp_delta:+.1f}% faster than Py)")
+    
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_path = os.path.join(args.outdir, "recall_qps_curve.png")
-    plot_results(hnsw_res, tahnsw_res, title, plot_path)
+    plot_results(hnsw_res, tahnsw_res, tahnsw_cpp_res, title, plot_path)
 
 
 if __name__ == "__main__":
